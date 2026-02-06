@@ -14,7 +14,7 @@ from auth import AuthManager
 from file_manager import FileManager
 from executor import ControlledExecutor
 from api import DeepSeekAPI
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 import pandas as pd
 import openpyxl
 import os
@@ -295,7 +295,7 @@ def preview_section():
             st.warning("No data in this sheet")
             return
         
-        # Configure AgGrid with cell click detection
+        # Configure AgGrid with row selection
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_selection(
             selection_mode="multiple",
@@ -303,20 +303,6 @@ def preview_section():
             rowMultiSelectWithClick=True
         )
         gb.configure_default_column(editable=False, filterable=True)
-        
-        # Add cell click detection via JavaScript
-        cell_click_js = JsCode("""
-        function(e) {
-            if (e.colDef) {
-                return {
-                    rowIndex: e.rowIndex,
-                    colId: e.colDef.field,
-                    value: e.value
-                };
-            }
-            return null;
-        }
-        """)
         
         grid_options = gb.build()
         
