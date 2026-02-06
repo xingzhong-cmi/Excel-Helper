@@ -3,7 +3,7 @@ Plan schema and validation module using Pydantic.
 Defines the structure for executable Excel operations.
 """
 from typing import List, Optional, Union, Dict, Any, Literal
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from enum import Enum
 
 
@@ -34,11 +34,10 @@ class DataType(str, Enum):
 
 class TargetSpec(BaseModel):
     """Specifies the target file and sheet for an operation."""
+    model_config = ConfigDict(frozen=True)
+    
     file_alias: str = Field(..., description="File alias (e.g., F1, F2)")
     sheet_name: str = Field(..., description="Sheet name to operate on")
-    
-    class Config:
-        frozen = True
 
 
 class FilterDeleteRowsParams(BaseModel):
@@ -61,10 +60,11 @@ class FillNullsParams(BaseModel):
     strategy: FillStrategy = Field(..., description="Fill strategy")
     value: Optional[Union[str, int, float]] = Field(None, description="Fixed value (required for fixed_value strategy)")
     
-    @validator('value')
-    def validate_value(cls, v, values):
+    @field_validator('value')
+    @classmethod
+    def validate_value(cls, v, info):
         """Ensure value is provided for fixed_value strategy."""
-        if values.get('strategy') == FillStrategy.FIXED_VALUE and v is None:
+        if info.data.get('strategy') == FillStrategy.FIXED_VALUE and v is None:
             raise ValueError("value is required when strategy is fixed_value")
         return v
 
@@ -86,7 +86,7 @@ class ColumnSplitParams(BaseModel):
 
 class ColumnMergeParams(BaseModel):
     """Parameters for merging columns."""
-    source_columns: List[str] = Field(..., min_items=2, description="Columns to merge")
+    source_columns: List[str] = Field(..., min_length=2, description="Columns to merge")
     target_column: str = Field(..., description="Name for the merged column")
     delimiter: str = Field(" ", description="Delimiter to join with")
     delete_sources: bool = Field(False, description="Whether to delete source columns after merge")
@@ -106,10 +106,11 @@ class Operation(BaseModel):
     ] = Field(..., description="Operation-specific parameters")
     description: Optional[str] = Field(None, description="Human-readable description of the operation")
     
-    @validator('params')
-    def validate_params_match_type(cls, v, values):
+    @field_validator('params')
+    @classmethod
+    def validate_params_match_type(cls, v, info):
         """Ensure params type matches operation type."""
-        op_type = values.get('type')
+        op_type = info.data.get('type')
         param_type_map = {
             OperationType.FILTER_DELETE_ROWS: FilterDeleteRowsParams,
             OperationType.DEDUPLICATE: DeduplicateParams,
@@ -126,11 +127,8 @@ class Operation(BaseModel):
 
 class ExecutionPlan(BaseModel):
     """A complete execution plan with multiple operations."""
-    operations: List[Operation] = Field(..., min_items=1, description="List of operations to execute")
-    description: Optional[str] = Field(None, description="Overall plan description")
-    
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "description": "Remove duplicates and fill missing values in sales data",
                 "operations": [
@@ -156,15 +154,19 @@ class ExecutionPlan(BaseModel):
                 ]
             }
         }
+    )
+    
+    operations: List[Operation] = Field(..., min_length=1, description="List of operations to execute")
+    description: Optional[str] = Field(None, description="Overall plan description")
     
     def to_json(self) -> str:
         """Export plan as JSON string."""
-        return self.json(indent=2, ensure_ascii=False)
+        return self.model_dump_json(indent=2)
     
     @classmethod
     def from_json(cls, json_str: str) -> 'ExecutionPlan':
         """Parse plan from JSON string."""
-        return cls.parse_raw(json_str)
+        return cls.model_validate_json(json_str)
     
     def validate_targets(self, available_files: Dict[str, Dict[str, Any]]) -> List[str]:
         """Validate that all operation targets exist.

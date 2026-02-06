@@ -5,6 +5,7 @@ import pandas as pd
 import openpyxl
 from typing import Dict, Any, List
 from datetime import datetime
+from pydantic import BaseModel
 from .plan import (
     ExecutionPlan, Operation, OperationType,
     FilterDeleteRowsParams, DeduplicateParams, FillNullsParams,
@@ -340,5 +341,3 @@ class PlanExecutor:
             "columns_deleted": columns_deleted
         }
 
-
-from pydantic import BaseModel

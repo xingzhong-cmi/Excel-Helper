@@ -109,7 +109,7 @@ class PlanGenerator:
             
             # Parse and validate plan
             try:
-                plan = ExecutionPlan.parse_raw(plan_json)
+                plan = ExecutionPlan.model_validate_json(plan_json)
                 
                 # Validate targets exist
                 validation_errors = plan.validate_targets(file_metadata)
