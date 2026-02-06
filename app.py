@@ -5,6 +5,11 @@ Main Streamlit application with user authentication and file management.
 import streamlit as st
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+# This should be done before any other imports that might use environment variables
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -119,9 +124,7 @@ def login_page():
                 st.warning("Please enter both username and password")
         
         st.markdown("---")
-        st.markdown("**Default admin credentials:**")
-        st.code("Username: admin\nPassword: admin123")
-        st.info("You can change these via environment variables ADMIN_USER and ADMIN_PASS")
+        st.info("💡 For admin access, please contact your administrator or configure admin credentials via environment variables (ADMIN_USER and ADMIN_PASS).")
 
 
 def sidebar_navigation():

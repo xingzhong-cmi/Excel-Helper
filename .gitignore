@@ -42,6 +42,9 @@ data/
 # Streamlit
 .streamlit/secrets.toml
 
+# Environment files (contains sensitive data)
+.env
+
 # OS
 .DS_Store
 Thumbs.db
