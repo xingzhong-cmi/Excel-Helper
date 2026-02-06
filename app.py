@@ -373,7 +373,8 @@ def render_execution_area():
                         data=result_data['file_bytes'],
                         file_name=f"modified_{doc_info['filename']}",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
+                        use_container_width=True,
+                        key=f"download_{doc_key}"
                     )
                 
                 with col_b:

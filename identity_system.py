@@ -14,7 +14,6 @@ class AccountProfile:
     """Represents a user account profile."""
     account_name: str
     account_uid: str
-    credential_digest: str
     admin_privileges: bool = False
 
 
