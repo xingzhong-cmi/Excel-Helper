@@ -5,6 +5,7 @@ Main Streamlit application with user authentication and file management.
 import streamlit as st
 import sys
 from pathlib import Path
+import json
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -13,10 +14,16 @@ from auth import AuthManager
 from file_manager import FileManager
 from executor import ControlledExecutor
 from api import DeepSeekAPI
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 import pandas as pd
 import openpyxl
 import os
+
+# Import new core modules
+from core.planner import PlanGenerator
+from core.executor import PlanExecutor
+from core.diff import ChangeSummary
+from core.plan import ExecutionPlan, OperationType, FillStrategy, DataType
 
 
 # Page configuration
@@ -90,6 +97,12 @@ def init_session_state():
         st.session_state.original_instruction = ""
     if "optimized_instruction" not in st.session_state:
         st.session_state.optimized_instruction = ""
+    if "generated_plan" not in st.session_state:
+        st.session_state.generated_plan = None
+    if "execution_result" not in st.session_state:
+        st.session_state.execution_result = None
+    if "form_operations" not in st.session_state:
+        st.session_state.form_operations = []
 
 
 def login_page():
@@ -282,7 +295,7 @@ def preview_section():
             st.warning("No data in this sheet")
             return
         
-        # Configure AgGrid for interactive selection
+        # Configure AgGrid with cell click detection
         gb = GridOptionsBuilder.from_dataframe(df)
         gb.configure_selection(
             selection_mode="multiple",
@@ -290,6 +303,21 @@ def preview_section():
             rowMultiSelectWithClick=True
         )
         gb.configure_default_column(editable=False, filterable=True)
+        
+        # Add cell click detection via JavaScript
+        cell_click_js = JsCode("""
+        function(e) {
+            if (e.colDef) {
+                return {
+                    rowIndex: e.rowIndex,
+                    colId: e.colDef.field,
+                    value: e.value
+                };
+            }
+            return null;
+        }
+        """)
+        
         grid_options = gb.build()
         
         grid_response = AgGrid(
@@ -308,20 +336,29 @@ def preview_section():
             # Update selection in session state
             st.session_state.selection = {
                 "file_alias": st.session_state.active_file,
-                "sheet": st.session_state.active_sheet,
+                "sheet_name": st.session_state.active_sheet,
                 "rows": list(selected_df.index),
+                "row_count": len(selected_df),
                 "columns": list(df.columns),
                 "data_sample": selected_df.head(3).to_dict()
             }
             
-            st.info(f"Selected {len(selected_df)} row(s)")
-            
-            # Show reference to insert
-            if st.button("📋 Insert Reference to Instruction"):
-                ref_text = f"{st.session_state.active_file}.{st.session_state.active_sheet}[rows:{','.join(map(str, selected_df.index[:5]))}]"
-                st.session_state.original_instruction += f" {ref_text}"
-                st.success("Reference added to instruction!")
-                st.rerun()
+            # Show selection card
+            with st.expander("📊 Current Selection", expanded=True):
+                st.write(f"**File:** {st.session_state.active_file}")
+                st.write(f"**Sheet:** {st.session_state.active_sheet}")
+                st.write(f"**Rows selected:** {len(selected_df)}")
+                if len(selected_df) <= 10:
+                    st.write(f"**Row indices:** {', '.join(map(str, selected_df.index))}")
+                else:
+                    st.write(f"**Row indices:** {', '.join(map(str, selected_df.index[:10]))}... (+{len(selected_df)-10} more)")
+                
+                # Insert reference button
+                if st.button("📋 Insert Reference to Instruction"):
+                    ref_text = f" {st.session_state.active_file}.{st.session_state.active_sheet}[rows:{','.join(map(str, selected_df.index[:5]))}{'...' if len(selected_df) > 5 else ''}]"
+                    st.session_state.original_instruction += ref_text
+                    st.success("Reference added to instruction!")
+                    st.rerun()
         
         # Show data info
         st.caption(f"Showing {len(df)} rows × {len(df.columns)} columns (limited to first 300 rows)")
@@ -361,11 +398,234 @@ def instruction_section():
     # Optimize button
     if st.button("✨ Optimize Instruction", key="optimize_button"):
         optimize_instruction()
+
+
+def plan_generation_section():
+    """Display plan generation section with AI and form-based options."""
+    st.markdown('<div class="sub-header">🎯 Plan Generation</div>', unsafe_allow_html=True)
     
-    # Show current selection info
-    if st.session_state.selection:
-        with st.expander("📊 Current Selection Info"):
-            st.json(st.session_state.selection)
+    instruction_to_use = st.session_state.optimized_instruction or st.session_state.original_instruction
+    
+    if not instruction_to_use and not st.session_state.generated_plan:
+        st.info("Enter an instruction above or use the manual form below to create a plan")
+        return
+    
+    # Show current plan if exists
+    if st.session_state.generated_plan:
+        st.success("✅ Plan generated successfully!")
+        with st.expander("📋 View Generated Plan (JSON)", expanded=False):
+            st.code(st.session_state.generated_plan.to_json(), language="json")
+        
+        # Show operation summary
+        st.markdown("**Operations:**")
+        for i, op in enumerate(st.session_state.generated_plan.operations):
+            st.write(f"{i+1}. **{op.type.value}** on `{op.target.file_alias}.{op.target.sheet_name}`")
+            if op.description:
+                st.caption(f"   ↳ {op.description}")
+    
+    # Generate plan buttons
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🤖 Generate Plan (AI)", key="generate_plan_ai", disabled=not instruction_to_use):
+            generate_plan_with_ai(instruction_to_use)
+    
+    with col2:
+        if st.button("🔄 Clear Plan", key="clear_plan"):
+            st.session_state.generated_plan = None
+            st.session_state.execution_result = None
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Manual plan builder form
+    with st.expander("📝 Manual Plan Builder", expanded=not st.session_state.generated_plan):
+        st.markdown("**Build a plan manually by adding operations:**")
+        
+        # Get available files and sheets for dropdowns
+        file_manager = FileManager(st.session_state.user["user_id"])
+        available_files = list(st.session_state.files.keys())
+        
+        if not available_files:
+            st.warning("No files available. Upload a file first.")
+            return
+        
+        # Operation type selector
+        op_type = st.selectbox(
+            "Operation Type",
+            options=[op.value for op in OperationType],
+            key="form_op_type"
+        )
+        
+        # Target selection
+        col1, col2 = st.columns(2)
+        with col1:
+            target_file = st.selectbox("Target File", available_files, key="form_target_file")
+        
+        with col2:
+            file_id = st.session_state.files[target_file]
+            file_path = file_manager.get_file_path(file_id)
+            sheet_names = file_manager.get_sheet_names(file_path) if file_path else []
+            target_sheet = st.selectbox("Target Sheet", sheet_names, key="form_target_sheet")
+        
+        # Get columns for the selected sheet
+        if file_path and target_sheet:
+            df = file_manager.read_sheet_data(file_path, target_sheet)
+            columns = list(df.columns) if not df.empty else []
+        else:
+            columns = []
+        
+        # Operation-specific parameters
+        op_params = {}
+        
+        if op_type == "filter_delete_rows":
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                op_params["column"] = st.selectbox("Column", columns, key="filter_col")
+            with col2:
+                op_params["condition"] = st.selectbox(
+                    "Condition",
+                    ["equals", "not_equals", "contains", "not_contains", "empty", "not_empty", "greater_than", "less_than"],
+                    key="filter_cond"
+                )
+            with col3:
+                op_params["action"] = st.selectbox("Action", ["delete", "keep"], key="filter_action")
+            
+            if op_params["condition"] not in ["empty", "not_empty"]:
+                op_params["value"] = st.text_input("Value", key="filter_value")
+        
+        elif op_type == "deduplicate":
+            op_params["columns"] = st.multiselect("Columns to check", columns, key="dedup_cols")
+            op_params["keep"] = st.selectbox("Keep", ["first", "last"], key="dedup_keep")
+        
+        elif op_type == "fill_nulls":
+            op_params["column"] = st.selectbox("Column", columns, key="fill_col")
+            op_params["strategy"] = st.selectbox(
+                "Strategy",
+                [s.value for s in FillStrategy],
+                key="fill_strategy"
+            )
+            if op_params["strategy"] == "fixed_value":
+                op_params["value"] = st.text_input("Fill Value", key="fill_value")
+        
+        elif op_type == "type_conversion":
+            op_params["column"] = st.selectbox("Column", columns, key="convert_col")
+            op_params["target_type"] = st.selectbox(
+                "Target Type",
+                [t.value for t in DataType],
+                key="convert_type"
+            )
+            if op_params["target_type"] in ["date", "datetime"]:
+                op_params["date_format"] = st.text_input("Date Format (e.g., %Y-%m-%d)", key="convert_format")
+        
+        elif op_type == "column_split":
+            op_params["source_column"] = st.selectbox("Source Column", columns, key="split_col")
+            op_params["delimiter"] = st.text_input("Delimiter", value=",", key="split_delim")
+            new_column_names_input = st.text_input(
+                "New Column Names (comma-separated)",
+                key="split_names"
+            )
+            op_params["new_column_names"] = [name.strip() for name in new_column_names_input.split(",")] if new_column_names_input else []
+            op_params["max_splits"] = st.number_input("Max Splits (-1 for unlimited)", value=-1, key="split_max")
+        
+        elif op_type == "column_merge":
+            op_params["source_columns"] = st.multiselect("Source Columns", columns, key="merge_cols")
+            op_params["target_column"] = st.text_input("Target Column Name", key="merge_target")
+            op_params["delimiter"] = st.text_input("Delimiter", value=" ", key="merge_delim")
+            op_params["delete_sources"] = st.checkbox("Delete source columns", key="merge_delete")
+        
+        # Description
+        description = st.text_input("Operation Description (optional)", key="form_description")
+        
+        # Add operation button
+        if st.button("➕ Add Operation to Plan"):
+            try:
+                operation_data = {
+                    "type": op_type,
+                    "file_alias": target_file,
+                    "sheet_name": target_sheet,
+                    "params": op_params,
+                    "description": description or None
+                }
+                st.session_state.form_operations.append(operation_data)
+                st.success(f"Operation added! Total: {len(st.session_state.form_operations)}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to add operation: {str(e)}")
+        
+        # Show current operations
+        if st.session_state.form_operations:
+            st.markdown("**Current Operations:**")
+            for i, op in enumerate(st.session_state.form_operations):
+                col1, col2 = st.columns([5, 1])
+                with col1:
+                    st.write(f"{i+1}. {op['type']} on {op['file_alias']}.{op['sheet_name']}")
+                with col2:
+                    if st.button("🗑️", key=f"remove_op_{i}"):
+                        st.session_state.form_operations.pop(i)
+                        st.rerun()
+            
+            # Build plan from operations
+            if st.button("🔨 Build Plan from Operations"):
+                build_plan_from_form()
+
+
+def generate_plan_with_ai(instruction: str):
+    """Generate plan using AI."""
+    planner = PlanGenerator()
+    
+    if not planner.is_ai_available():
+        st.warning("⚠️ DeepSeek API key not configured. Use the manual plan builder below.")
+        return
+    
+    # Gather file metadata
+    file_manager = FileManager(st.session_state.user["user_id"])
+    file_metadata = {}
+    
+    for alias, file_id in st.session_state.files.items():
+        file_path = file_manager.get_file_path(file_id)
+        if file_path:
+            metadata = file_manager.get_file_metadata(file_path)
+            file_metadata[alias] = metadata
+    
+    with st.spinner("🤖 Generating plan with AI..."):
+        result = planner.generate_plan_from_instruction(
+            instruction,
+            file_metadata,
+            st.session_state.selection,
+            st.session_state.active_file,
+            st.session_state.active_sheet
+        )
+    
+    if result["success"]:
+        st.session_state.generated_plan = result["plan"]
+        st.success("✅ Plan generated successfully!")
+        st.rerun()
+    else:
+        st.error(f"❌ Plan generation failed: {result.get('error', 'Unknown error')}")
+        if result.get("raw_response"):
+            with st.expander("🔍 View raw AI response"):
+                st.code(result["raw_response"])
+
+
+def build_plan_from_form():
+    """Build plan from manually added operations."""
+    if not st.session_state.form_operations:
+        st.warning("No operations added yet")
+        return
+    
+    planner = PlanGenerator()
+    
+    with st.spinner("🔨 Building plan..."):
+        result = planner.create_plan_from_form(st.session_state.form_operations)
+    
+    if result["success"]:
+        st.session_state.generated_plan = result["plan"]
+        st.session_state.form_operations = []  # Clear form operations
+        st.success("✅ Plan created from form!")
+        st.rerun()
+    else:
+        st.error(f"❌ Failed to create plan: {result.get('error', 'Unknown error')}")
 
 
 def optimize_instruction():
@@ -407,113 +667,165 @@ def optimize_instruction():
 
 
 def execution_section():
-    """Display execution section."""
+    """Display execution section with new PlanExecutor."""
     st.markdown('<div class="sub-header">▶️ Execution</div>', unsafe_allow_html=True)
     
-    instruction_to_use = st.session_state.optimized_instruction or st.session_state.original_instruction
-    
-    if not instruction_to_use:
-        st.info("Please enter an instruction first")
+    if not st.session_state.generated_plan:
+        st.info("Generate a plan first to execute operations")
         return
     
-    st.markdown("**Instruction to execute:**")
-    st.code(instruction_to_use)
+    st.markdown("**Ready to execute:**")
+    st.write(f"📋 {len(st.session_state.generated_plan.operations)} operation(s) in the plan")
     
-    if st.button("▶️ Execute", key="execute_button"):
-        execute_instruction(instruction_to_use)
+    if st.button("▶️ Execute Plan", key="execute_plan_button"):
+        execute_plan()
+    
+    # Show results if available
+    if st.session_state.execution_result:
+        display_execution_results()
 
 
-def execute_instruction(instruction: str):
-    """Execute the given instruction."""
+def execute_plan():
+    """Execute the generated plan using PlanExecutor."""
     file_manager = FileManager(st.session_state.user["user_id"])
-    executor = ControlledExecutor()
+    executor = PlanExecutor()
     
     # Progress tracking
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     try:
-        # Stage 1: Reading files
-        status_text.text("📖 Reading files...")
+        # Stage 1: Loading workbooks
+        status_text.text("📖 Loading workbooks...")
         progress_bar.progress(0.2)
         
-        # Get file metadata
-        file_metadata = {}
-        for alias, file_id in st.session_state.files.items():
-            file_path = file_manager.get_file_path(file_id)
-            if file_path:
-                metadata = file_manager.get_file_metadata(file_path)
-                file_metadata[alias] = metadata
+        # Load all workbooks referenced in the plan
+        workbooks = {}
+        file_aliases = set(op.target.file_alias for op in st.session_state.generated_plan.operations)
         
-        # Stage 2: Parsing instruction
-        status_text.text("🔍 Parsing instruction...")
+        for alias in file_aliases:
+            if alias in st.session_state.files:
+                file_id = st.session_state.files[alias]
+                file_path = file_manager.get_file_path(file_id)
+                if file_path:
+                    workbooks[alias] = openpyxl.load_workbook(file_path)
+        
+        # Stage 2: Executing plan
+        status_text.text("⚙️ Executing operations...")
         progress_bar.progress(0.4)
         
-        operations = executor.parse_instruction(instruction, file_metadata)
+        result = executor.execute_plan(st.session_state.generated_plan, workbooks)
         
-        if not operations:
-            st.warning("⚠️ No operations could be parsed from the instruction. This is a simplified implementation.")
-            st.info("💡 In production, the LLM would generate structured operations from your instruction.")
-            return
+        # Stage 3: Saving results
+        status_text.text("💾 Saving results...")
+        progress_bar.progress(0.7)
         
-        # Stage 3: Executing operations
-        status_text.text("⚙️ Executing operations...")
-        progress_bar.progress(0.6)
+        # Save modified workbooks
+        saved_files = {}
+        for alias, wb in workbooks.items():
+            if alias in st.session_state.files:
+                file_id = st.session_state.files[alias]
+                new_revision = file_manager.save_modified_file(file_id, wb)
+                saved_files[alias] = {"revision": new_revision, "file_id": file_id}
         
-        # For now, execute on the active file
-        if st.session_state.active_file:
-            file_id = st.session_state.files[st.session_state.active_file]
-            file_path = file_manager.get_file_path(file_id)
-            
-            if file_path:
-                wb = openpyxl.load_workbook(file_path)
-                result = executor.execute_operations(
-                    operations,
-                    wb,
-                    st.session_state.active_sheet
-                )
-                
-                # Stage 4: Saving results
-                status_text.text("💾 Saving results...")
-                progress_bar.progress(0.8)
-                
-                if result["success"] or result["operations_completed"] > 0:
-                    new_revision = file_manager.save_modified_file(file_id, wb)
-                    
-                    # Stage 5: Complete
-                    status_text.text("✅ Complete!")
-                    progress_bar.progress(1.0)
-                    
-                    st.success(f"✅ Execution completed! {result['operations_completed']} operations performed.")
-                    st.info(f"📦 New revision created: rev_{new_revision}")
-                    
-                    if result["errors"]:
-                        st.warning("⚠️ Some operations had errors:")
-                        for error in result["errors"]:
-                            st.text(f"  • {error}")
-                    
-                    # Show download button
-                    with open(file_manager.get_file_path(file_id, new_revision), "rb") as f:
-                        st.download_button(
-                            "⬇️ Download Result",
-                            f,
-                            file_name=f"result_{file_id}_rev{new_revision}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                    
-                    # Accept changes button
-                    if st.button("✔️ Accept Changes and Continue"):
-                        st.success("Changes accepted! This revision is now active.")
-                        st.rerun()
-                else:
-                    st.error("❌ Execution failed. No operations could be completed.")
-                    for error in result["errors"]:
-                        st.text(f"  • {error}")
+        # Stage 4: Complete
+        status_text.text("✅ Complete!")
+        progress_bar.progress(1.0)
+        
+        # Store result
+        st.session_state.execution_result = {
+            **result,
+            "saved_files": saved_files
+        }
+        
+        st.success(f"✅ Execution completed! {result['operations_completed']} operations performed.")
+        st.rerun()
         
     except Exception as e:
         st.error(f"❌ Execution failed: {str(e)}")
         status_text.text("❌ Failed")
         progress_bar.progress(1.0)
+
+
+def display_execution_results():
+    """Display execution results with change summary and preview."""
+    result = st.session_state.execution_result
+    
+    st.markdown("---")
+    st.markdown("### 📊 Execution Results")
+    
+    # Generate and display change summary
+    summary = ChangeSummary.generate_summary(result)
+    st.markdown(summary)
+    
+    st.markdown("---")
+    
+    # Preview modified sheets
+    st.markdown("### 👁️ Preview Modified Data")
+    
+    file_manager = FileManager(st.session_state.user["user_id"])
+    
+    # Get the first modified file for preview
+    if result.get("saved_files"):
+        first_alias = list(result["saved_files"].keys())[0]
+        file_info = result["saved_files"][first_alias]
+        file_id = file_info["file_id"]
+        revision = file_info["revision"]
+        
+        file_path = file_manager.get_file_path(file_id, revision)
+        
+        if file_path:
+            sheet_names = file_manager.get_sheet_names(file_path)
+            
+            if sheet_names:
+                selected_sheet = st.selectbox("Select sheet to preview", sheet_names, key="preview_result_sheet")
+                
+                try:
+                    df = file_manager.read_sheet_data(file_path, selected_sheet)
+                    
+                    # Show first 300 rows
+                    preview_df = df.head(300)
+                    st.dataframe(preview_df, use_container_width=True)
+                    st.caption(f"Showing first 300 rows of {len(df)} total rows × {len(df.columns)} columns")
+                    
+                except Exception as e:
+                    st.error(f"Error loading preview: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Download buttons for all modified files
+    st.markdown("### ⬇️ Download Results")
+    
+    for alias, file_info in result.get("saved_files", {}).items():
+        file_id = file_info["file_id"]
+        revision = file_info["revision"]
+        file_path = file_manager.get_file_path(file_id, revision)
+        
+        if file_path:
+            with open(file_path, "rb") as f:
+                st.download_button(
+                    f"⬇️ Download {alias} (rev_{revision})",
+                    f,
+                    file_name=f"{alias}_result_rev{revision}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"download_{alias}"
+                )
+    
+    # Accept changes button
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✔️ Accept Changes and Continue"):
+            st.success("Changes accepted! You can continue working with the modified files.")
+            st.session_state.execution_result = None
+            st.rerun()
+    
+    with col2:
+        if st.button("🔄 Start New Operation"):
+            st.session_state.generated_plan = None
+            st.session_state.execution_result = None
+            st.session_state.original_instruction = ""
+            st.session_state.optimized_instruction = ""
+            st.rerun()
 
 
 def main_app():
@@ -546,6 +858,12 @@ def main_app():
     
     st.markdown("---")
     
+    # Plan generation section
+    plan_generation_section()
+    
+    st.markdown("---")
+    
+    # Execution section
     execution_section()
     
     # Footer
