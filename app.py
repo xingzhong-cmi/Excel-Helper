@@ -734,77 +734,67 @@ def execute_plan():
 
 
 def display_execution_results():
-    """Display execution results with change summary and preview."""
+    """Display execution results with change summary, preview, and download."""
     result = st.session_state.execution_result
-    
+    file_manager = FileManager(st.session_state.user["user_id"])
+
     st.markdown("---")
     st.markdown("### 📊 Execution Results")
-    
-    # Generate and display change summary
-    summary = ChangeSummary.generate_summary(result)
-    st.markdown(summary)
-    
+
+    saved_files = result.get("saved_files", {})
+
+    # Use tabs: Summary | Preview | Download
+    tab_summary, tab_preview, tab_download = st.tabs(["📋 Summary", "👁️ Preview", "⬇️ Download"])
+
+    with tab_summary:
+        summary = ChangeSummary.generate_summary(result)
+        st.markdown(summary)
+
+    with tab_preview:
+        if not saved_files:
+            st.info("No modified files to preview.")
+        else:
+            # One sub-tab per modified file
+            file_aliases = list(saved_files.keys())
+            if len(file_aliases) == 1:
+                alias = file_aliases[0]
+                _render_file_preview(alias, saved_files[alias], file_manager)
+            else:
+                file_tabs = st.tabs(file_aliases)
+                for file_tab, alias in zip(file_tabs, file_aliases):
+                    with file_tab:
+                        _render_file_preview(alias, saved_files[alias], file_manager)
+
+    with tab_download:
+        if not saved_files:
+            st.info("No files available for download.")
+        else:
+            for alias, file_info in saved_files.items():
+                file_id = file_info["file_id"]
+                revision = file_info["revision"]
+                file_path = file_manager.get_file_path(file_id, revision)
+
+                if file_path:
+                    with open(file_path, "rb") as f:
+                        file_bytes = f.read()
+                    st.download_button(
+                        label=f"⬇️ Download {alias} (rev_{revision})",
+                        data=file_bytes,
+                        file_name=f"{alias}_result_rev{revision}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"download_{alias}",
+                    )
+
     st.markdown("---")
-    
-    # Preview modified sheets
-    st.markdown("### 👁️ Preview Modified Data")
-    
-    file_manager = FileManager(st.session_state.user["user_id"])
-    
-    # Get the first modified file for preview
-    if result.get("saved_files"):
-        first_alias = list(result["saved_files"].keys())[0]
-        file_info = result["saved_files"][first_alias]
-        file_id = file_info["file_id"]
-        revision = file_info["revision"]
-        
-        file_path = file_manager.get_file_path(file_id, revision)
-        
-        if file_path:
-            sheet_names = file_manager.get_sheet_names(file_path)
-            
-            if sheet_names:
-                selected_sheet = st.selectbox("Select sheet to preview", sheet_names, key="preview_result_sheet")
-                
-                try:
-                    df = file_manager.read_sheet_data(file_path, selected_sheet)
-                    
-                    # Show first 300 rows
-                    preview_df = df.head(300)
-                    st.dataframe(preview_df, use_container_width=True)
-                    st.caption(f"Showing first 300 rows of {len(df)} total rows × {len(df.columns)} columns")
-                    
-                except Exception as e:
-                    st.error(f"Error loading preview: {str(e)}")
-    
-    st.markdown("---")
-    
-    # Download buttons for all modified files
-    st.markdown("### ⬇️ Download Results")
-    
-    for alias, file_info in result.get("saved_files", {}).items():
-        file_id = file_info["file_id"]
-        revision = file_info["revision"]
-        file_path = file_manager.get_file_path(file_id, revision)
-        
-        if file_path:
-            with open(file_path, "rb") as f:
-                st.download_button(
-                    f"⬇️ Download {alias} (rev_{revision})",
-                    f,
-                    file_name=f"{alias}_result_rev{revision}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"download_{alias}"
-                )
-    
-    # Accept changes button
+
+    # Action buttons
     col1, col2 = st.columns(2)
     with col1:
         if st.button("✔️ Accept Changes and Continue"):
             st.success("Changes accepted! You can continue working with the modified files.")
             st.session_state.execution_result = None
             st.rerun()
-    
+
     with col2:
         if st.button("🔄 Start New Operation"):
             st.session_state.generated_plan = None
@@ -812,6 +802,43 @@ def display_execution_results():
             st.session_state.original_instruction = ""
             st.session_state.optimized_instruction = ""
             st.rerun()
+
+
+def _render_file_preview(alias: str, file_info: dict, file_manager: "FileManager"):
+    """Render a sheet-selector and dataframe preview for one modified file."""
+    file_id = file_info["file_id"]
+    revision = file_info["revision"]
+    file_path = file_manager.get_file_path(file_id, revision)
+
+    if not file_path:
+        st.warning(f"File {alias} (rev_{revision}) not found.")
+        return
+
+    sheet_names = file_manager.get_sheet_names(file_path)
+    if not sheet_names:
+        st.warning(f"No sheets found in {alias}.")
+        return
+
+    selected_sheet = st.selectbox(
+        "Select sheet to preview",
+        sheet_names,
+        key=f"preview_sheet_{alias}",
+    )
+
+    try:
+        # Read a full row-count using openpyxl (header row excluded), then
+        # load up to 300 rows for display via pandas.
+        with openpyxl.load_workbook(file_path, read_only=True, data_only=True) as _wb:
+            total_rows = max(_wb[selected_sheet].max_row - 1, 0)  # subtract header
+
+        df = file_manager.read_sheet_data(file_path, selected_sheet, max_rows=300)
+        st.dataframe(df, use_container_width=True)
+        st.caption(
+            f"Showing first {len(df)} rows of {total_rows} total rows"
+            f" × {len(df.columns)} columns"
+        )
+    except Exception as e:
+        st.error(f"Error loading preview: {str(e)}")
 
 
 def main_app():
